@@ -1,0 +1,3 @@
+encoding: "cp1252"
+sep: ";"
+decimal: "."
