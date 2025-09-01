@@ -92,6 +92,7 @@ def generate_visit_patterns(dias_semana): #Dos 5 dias, cria padroes de frequenci
 
     return visit_patterns
 
+
 def main(developer=False):
     # ----------------------------------------------------------------------------------
     # Parâmetro:
@@ -138,9 +139,33 @@ def main(developer=False):
     config_sheet = wb.sheets['Configurações']
     frequency_sheet = wb.sheets['Frequências']
 
-    # 4) Carrega dados auxiliares de patrimônios (dias por semana)
+    # 4) Carrega dados auxiliares
     patrimonios_df = pd.read_excel(model_data_folder + 'Dados.xlsx', sheet_name='patrimonios')
     patrimonios_df['PATRIMONIO'] = patrimonios_df['PATRIMONIO'].apply(std_codes)
+
+    # >>>>>>>>>>> NOVO: leitura da aba parceiros <<<<<<<<<<
+    parceiros_df = pd.read_excel(model_data_folder + 'Dados.xlsx', sheet_name='parceiros')
+    parceiros_df['PARCEIRO'] = parceiros_df['PARCEIRO'].apply(std_codes)
+
+    # De-para texto -> número (1=Segunda, ..., 5=Sexta)
+    dia_map = {
+        'SEGUNDA-FEIRA': 1,
+        'TERÇA-FEIRA': 2,
+        'QUARTA-FEIRA': 3,
+        'QUINTA-FEIRA': 4,
+        'SEXTA-FEIRA': 5
+    }
+
+    # Converter para índice interno (0=Segunda, ..., 4=Sexta). Se vazio, vira NaN.
+    parceiros_df['DIA_ENTREGA_IDX'] = (
+        parceiros_df['DIA_ENTREGA']
+            .astype(str)
+            .str.upper()
+            .map(dia_map)
+    )
+    parceiros_df['DIA_ENTREGA_IDX'] = parceiros_df['DIA_ENTREGA_IDX'] - 1
+    parceiro_dia_fixo = parceiros_df.set_index('PARCEIRO')['DIA_ENTREGA_IDX'].to_dict()
+    # >>>>>>>>>>> FIM NOVO <<<<<<<<<<
 
     # 5) Parâmetro: número de dias de operação da semana (ex.: 5 ou 6)
     dias_semana = int(config_sheet['D7'].value)
@@ -154,9 +179,8 @@ def main(developer=False):
     freq_df['FILIAL'] = freq_df['FILIAL'].astype(str)
     freq_df['PARCEIRO'] = freq_df['PARCEIRO'].apply(std_codes)
     freq_df['PATRIMONIO'] = freq_df['PATRIMONIO'].apply(std_codes)
-    freq_df['FREQUENCIA'] = freq_df['FREQUENCIA'].astype(int)
 
-    # Trazer DIAS_POR_SEMANA e flag de permissão de sábado (ALLOW_SATURDAY)
+    # Trazer DIAS_POR_SEMANA
     freq_df = freq_df.merge(patrimonios_df[['PATRIMONIO', 'DIAS_POR_SEMANA']],
                             on='PATRIMONIO',
                             how='left')
@@ -180,35 +204,11 @@ def main(developer=False):
         for f, patterns in visit_patterns.items():
             if f not in merged_visit_patterns:
                 merged_visit_patterns[f] = set()  # Use set to avoid duplicates
-
             merged_visit_patterns[f].update(patterns)
 
-    # Converter sets em listas ordenadas
     visit_patterns = {f: sorted(merged_visit_patterns[f]) for f in merged_visit_patterns}
 
-    # (Mantidos comentários/originais abaixo como referência histórica do cálculo de padrões)
-    # visit_pattern = {}
-    # for f in range(1, n_p + 1):
-    #     min_interval = n_p//f
-    #     max_interval = math.ceil(n_p/f)
-    #     max_interval_jumps = n_p%f
-    #     pattern = []
-    #     for p in range(0, max_interval_jumps*max_interval, max_interval):
-    #         pattern.append(p)
-    #     for p in range(max_interval_jumps*max_interval, n_p, min_interval):
-    #         pattern.append(p)
-    #     visit_pattern[f] = pattern
-
-    # visit_patterns = {f:[] for f in range(1, n_p + 1)}
-    # for f in range(1, n_p + 1):
-    #     for s in range(0, n_p):
-    #         pattern = [(t+s)%n_p for t in visit_pattern[f]]
-    #         pattern.sort()
-    #         pattern = tuple(pattern)
-    #         visit_patterns[f].append(pattern)
-    #     visit_patterns[f] = list(set(visit_patterns[f]))
-
-    # 8) Resolver por filial para permitir paralelismo futuro e logs claros
+    # 8) Resolver por filial
     cronograma_df = pd.DataFrame()
     filiais = freq_df['FILIAL'].unique().tolist()
 
@@ -218,67 +218,74 @@ def main(developer=False):
 
         # Filtra dados da filial
         index = freq_df['FILIAL'] == filial
-
         patrimonios = freq_df[index]['PATRIMONIO'].unique().tolist()
         patr_freq = freq_df[index].set_index('PATRIMONIO')['FREQUENCIA'].to_dict()
         patr_parc = freq_df[index].set_index('PATRIMONIO')['PARCEIRO'].to_dict()
 
-        # 8.1) Opções de padrão por patrimônio (todos os padrões de sua frequência)
+        # 8.1) Opções de padrão por patrimônio
         group_pattern = {
-            i: {
-                p:dias
-                for p, dias in enumerate(visit_patterns[patr_freq[i]])}
+            i: {p:dias for p, dias in enumerate(visit_patterns[patr_freq[i]])}
             for i in patrimonios}
         
-        # 8.2) Remover padrões com sábado quando não permitido (ALLOW_SATURDAY == False)
+        # 8.2) Remover padrões com sábado quando não permitido
         group_pattern = {
             i: {
                 p: dias 
                 for p, dias in group_pattern[i].items()
-                if (freq_df.loc[freq_df['PATRIMONIO'] == i, 'ALLOW_SATURDAY'].values[0] | (5 not in dias))
+                if (freq_df.loc[freq_df['PATRIMONIO'] == i, 'ALLOW_SATURDAY'].values[0] or (5 not in dias))
             }
             for i in patrimonios} 
         
-        # 8.3) Reenumerar padrões (assegura chaves 0..k-1 por patrimônio após filtragem)
+        # 8.3) Reenumerar padrões
         group_pattern = {i:{p:dias for p, dias in enumerate(group_pattern[i].values())} for i in patrimonios}
 
-        # Conjunto de dias [0..n_p-1]
         dias = [t for t in range(0, n_p)]
 
-        # 9) Construção do solver MIP (SCIP)
+        # 9) Construção do solver MIP
         solver = pywraplp.Solver.CreateSolver('SCIP')
 
         # 9.1) Variáveis de decisão
-        # x[i][p] = 1 se patrimônio i escolhe o padrão p; 0 caso contrário
         x = {i:{} for i in patrimonios}
         for i in patrimonios:
             for p in group_pattern[i].keys():
                 x[i][p] = solver.IntVar(0, 1, f'x[{i},{p}]')
 
-        # max_w: variável real que representa a carga máxima (visitas) em um dia
         max_w = solver.NumVar(0, solver.infinity(), f'max_w')
 
-        # 9.2) Função objetivo: minimizar max_w (uniformizar o cronograma)
+        # 9.2) Função objetivo
         obj = solver.Objective()
         obj.SetCoefficient(max_w, 1)
         obj.SetMinimization()
 
         # 9.3) Restrições
-        # (a) Cada patrimônio deve adotar exatamente UM padrão
         for i in patrimonios:
             solver.Add(sum(x[i][p] for p in group_pattern[i].keys()) == 1)
 
-        # (b) Definição de max_w: para cada dia t, a soma de visitas do dia ≤ max_w
-        for t in dias: # deixar uniforme a distirbuição de dias
+        for t in dias:
             solver.Add(max_w >= sum(sum(x[i][p] for p, days in group_pattern[i].items() if t in days) for i in patrimonios))
 
-        # 9.4) Resolver MIP (tempo limite e gap)
+        # >>>>>>>>>>> NOVO: restrição de dia fixo por parceiro <<<<<<<<<<
+        for parceiro, dia_fixo in parceiro_dia_fixo.items():
+            if pd.isna(dia_fixo):  # sem restrição se vazio
+                continue
+            patrimonios_parc = [i for i in patrimonios if patr_parc[i] == parceiro]
+            if patrimonios_parc:
+                solver.Add(
+                    sum(
+                        x[i][p]
+                        for i in patrimonios_parc
+                        for p, dias in group_pattern[i].items()
+                        if dia_fixo in dias
+                    ) >= 1
+                )
+        # >>>>>>>>>>> FIM NOVO <<<<<<<<<<
+
+        # 9.4) Resolver
         solver.SetTimeLimit(180*1000)
-        solver.SetSolverSpecificParametersAsString("mip_gap = 0.01")  # Gap de 1%
-        #solver.EnableOutput()
+        solver.SetSolverSpecificParametersAsString("mip_gap = 0.01")
         status = solver.Solve()
         
-        # 9.5) Extrair solução escolhida e montar linhas do cronograma
+        # 9.5) Extrair solução
         result = {'FILIAL':[], 'PARCEIRO':[],'PATRIMONIO':[], 'FREQUENCIA':[], 'DIA':[]}
         for i in patrimonios:
             for p, days in group_pattern[i].items():
@@ -291,14 +298,13 @@ def main(developer=False):
                         result['DIA'].append(day)
 
         cronograma_df = pd.concat([cronograma_df, pd.DataFrame(result)])
-
         print(f'Cronograma obtido para a filial {filial}, tempo: {time.time() - filial_start:.1f}s')
     
     print('Cronogramas obtidos para todas as filiais, tempo: {:.1f}s'.format(time.time() - section_start))
     section_start = time.time()
     print('Salvando cronogramas obtidos na aba "Cronogramas"...')
 
-    # 10) Pivotar em colunas 1..n_p marcando 'X' nos dias escolhidos
+    # 10) Pivotar em colunas 1..n_p marcando 'X'
     for p in range(1, n_p+1):
         cronograma_df[f'{p}'] = (cronograma_df['DIA'] == (p - 1))
     cronograma_df = cronograma_df.groupby(['FILIAL', 'PARCEIRO', 'PATRIMONIO', 'FREQUENCIA']).agg({f'{p}':'sum' for p in range(1, n_p+1)}).reset_index()
@@ -306,58 +312,42 @@ def main(developer=False):
         cronograma_df[f'{p}'] = cronograma_df[f'{p}'].astype(str).replace('0', '').replace('1', 'X')
     cronograma_df = cronograma_df.rename(columns={'FREQUENCIA':'Frequência (visitas/semana)'})
 
-    # 11) Escrita e formatação na aba "Cronograma"
-    sheet = wb.sheets['Cronograma']  # Seleciona a aba específica
-    # Limpa conteúdo e formatos
+    # 11) Escrita no Excel
+    sheet = wb.sheets['Cronograma']
     sheet.range("6:1048576").clear_contents()
     sheet.range("F7:XFD1048576").api.ClearFormats()
-    # Escreve a tabela
     sheet['B7'].options(index=False).value = cronograma_df 
-
-    # Cabeçalho "Dia" (celular F6)
     sheet.cells(6, 6).value = 'Dia'
 
     rows = len(cronograma_df)
-
-    # Formatação: intervalo principal
     cells = sheet.range((7, 2), (7 + rows, 5 + n_p))
     cells.api.Font.Name = "Arial Narrow"
 
-    # Bordas (API COM) — atenção: cores em BGR
     borders = cells.api.Borders
+    borders(11).Weight = 4
+    borders(11).Color = 0xFFFFFF
+    borders(12).Weight = 2
+    borders(12).Color = 0xD2D2D2
+    borders(8).Weight = 2
+    borders(8).Color = 0xD2D2D2
+    borders(9).Weight = 4
+    borders(9).Color = 0xD2D2D2
 
-    # Bordas verticais (grossas e brancas)
-    borders(11).Weight = 4  # xlEdgeLeft, grossa
-    borders(11).Color = 0xFFFFFF  # Branco
-
-    # Bordas horizontais (finas e cinza)
-    borders(12).Weight = 2  # xlEdgeTop, fina
-    borders(12).Color = 0xD2D2D2  # Preto
-    borders(8).Weight = 2  # xlEdgeTop, fina
-    borders(8).Color = 0xD2D2D2  # Preto
-    borders(9).Weight = 4  # xlEdgeBottom, fina
-    borders(9).Color = 0xD2D2D2  # Preto
-
-    # Formatar cabeçalhos dos dias
     cells = sheet.range((7, 6), (8, 5 + n_p))
     borders = cells.api.Borders
-    borders(11).Weight = 4  # xlEdgeLeft, grossa
-    borders(11).Color = 0xFFFFFF  # Branco
+    borders(11).Weight = 4
+    borders(11).Color = 0xFFFFFF
 
-    # Formatar corpo do cronograma (dias com 'X')
     cells = sheet.range((8, 6), (7 + rows, 5 + n_p))
     cells.api.Font.Bold = True
     cells.api.Font.Name = "Arial Narrow"
     cells.api.Interior.Color = 0xF4EDFC
-    cells.api.HorizontalAlignment = -4108     # Alinhamento horizontal (centro)
-    cells.api.VerticalAlignment = -4108       # Alinhamento vertical (centro)
+    cells.api.HorizontalAlignment = -4108
+    cells.api.VerticalAlignment = -4108
         
-    
     print('Cronogramas salvos com sucesso, tempo: {:.1f}s'.format(time.time() - section_start))
-
     print('Obtenção de Cronogramas Encerrada, tempo total: {:.1f}s\nPrecione Enter para continuar...'.format(time.time() - start))
    
-    # 12) Encerramento (fecha workbook automaticamente no modo developer)
     if developer:
         wb.close()
     else:
