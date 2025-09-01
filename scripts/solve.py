@@ -659,6 +659,7 @@ def main(developer=False, tempo_abastecimento=None, rota_1_pra_1=False,
                                     (grouped_df['PERIODO'] == periodo) &
                                     (grouped_df['SUPERVISOR'] == supervisor)].copy()
                 
+
                 # Dicionários de distância/tempo por POINT_ID (i,j)
                 dist_dict = distance_matrix[distance_matrix['FILIAL'] == filial].set_index(['POINT_ID_I','POINT_ID_J'])['DISTANCE'].to_dict()
                 time_dict = distance_matrix[distance_matrix['FILIAL'] == filial].set_index(['POINT_ID_I','POINT_ID_J'])['DURATION'].to_dict()
@@ -710,11 +711,14 @@ def main(developer=False, tempo_abastecimento=None, rota_1_pra_1=False,
                         if (j != 'BASE') & (parceiro[i] != parceiro[j]):
                             lote.time[i][j] = lote.time[i][j] + tempo_entrada[j]
 
-                # (Opcional) Força grupos no mesmo veículo (mantido desativado como original)
+                # Força que todos os GROUPs de um mesmo PARCEIRO fiquem no mesmo veículo
                 same_vehicle_groups = []
-                # ... blocos comentados mantidos ...
+                for _, g in lote_df.groupby('PARCEIRO'):
+                    grupos = g['GROUP'].dropna().unique().tolist()
+                    if len(grupos) > 1:
+                        same_vehicle_groups.append(grupos)
 
-                if len(same_vehicle_groups) > 0:
+                if same_vehicle_groups:
                     lote.same_vehicle_groups = same_vehicle_groups
 
                 # =====================
@@ -757,6 +761,7 @@ def main(developer=False, tempo_abastecimento=None, rota_1_pra_1=False,
 
         # Remove arcos artificiais para BASE na listagem final de visitas
         result_df = result_df[result_df['PARCEIRO'] != 'BASE'].copy()
+
 
 
     # Quebrando rota principal do modelo 1:1 em subrotas
@@ -1073,66 +1078,99 @@ def main(developer=False, tempo_abastecimento=None, rota_1_pra_1=False,
     # ---------------------
     # Se modo normal: heurística de emparelhamento de livros entre períodos; se 1:1:
     # abastecedor nomeado por livro agregado (depara_livro).
+
+    # --------------------- (NOVO) Pré-processo: travar livros com parceiro fixo ---------------------
+    # Para cada LIVRO, verificar se há abastecedor fixo único. Se sim, travar.
+    fixo_merge = (result_df[result_df['VISITA'] != 0]
+                .merge(parceiros_df[['FILIAL','PARCEIRO','ABASTECEDOR']], on=['FILIAL','PARCEIRO'], how='left'))
+    fixo_merge['ABASTECEDOR'] = fixo_merge['ABASTECEDOR'].fillna('-')
+
+    # Conjunto de fixos por livro
+    livro_fixos = (fixo_merge[fixo_merge['ABASTECEDOR']!='-']
+                .groupby(['FILIAL','LIVRO'])['ABASTECEDOR']
+                .agg(lambda s: sorted(set(map(str, s))))
+                .reset_index())
+
+    # Classificação dos livros:
+    # - FIXO_UNICO: exatamente 1 abastecedor fixo → travar
+    # - SEM_FIXO: nenhum fixo → vai para heurística
+    
+    livro_fixos['N_FIXOS'] = livro_fixos['ABASTECEDOR'].apply(len)
+    livros_fixo_unico = livro_fixos[livro_fixos['N_FIXOS']==1].copy()
+    livros_conflito   = livro_fixos[livro_fixos['N_FIXOS']>1].copy()
+
+    # dicionário inicial de alocação com TRAVAS
+    alocation_dict = {}  # (pode ser reusado abaixo)
+    for _, r in livros_fixo_unico.iterrows():
+        alocation_dict[r['LIVRO']] = r['ABASTECEDOR'][0]
+
+    # Flag de conflito por livro (para diagnóstico/relatório)
+    result_livros_df = result_livros_df.merge(
+        livro_fixos[['LIVRO']].assign(CONFLITO_ABAST=result_livros_df['LIVRO'].isin(livros_conflito['LIVRO'] if len(livros_conflito)>0 else [])),
+        on='LIVRO', how='left'
+    ).fillna({'CONFLITO_ABAST': False})
+    # -------------------------------------------------------------------------
+
     if not rota_1_pra_1:
-        alocation_dict = {}
         for supervisor in supervisores_filial.keys():
             filial = supervisores_filial[supervisor]
             filial_df = result_livros_df[((result_livros_df['FILIAL'] == filial) &
-                                          (result_livros_df['SUPERVISOR'] == supervisor))].copy()
+                                        (result_livros_df['SUPERVISOR'] == supervisor))].copy()
 
-            livros = filial_df['LIVRO'].unique().tolist()
-            periodos = filial_df['PERIODO'].unique().tolist()
+            # Livros já travados pelo passo 0 (fixo único)
+            livros_travados = set([L for L in alocation_dict.keys()
+                                if L in filial_df['LIVRO'].unique().tolist()])
+
+            # Livros livres (sem fixo) para a heurística
+            livros = [L for L in filial_df['LIVRO'].unique().tolist() if L not in livros_travados]
+            periodos = sorted(filial_df['PERIODO'].unique().tolist())
             abastecedores = [i for i in range(len(livros))]
             pivot = {i:j for i,j in enumerate(livros)}
-
             periodo = filial_df.set_index('LIVRO')['PERIODO'].to_dict()
             max_dist = config[filial]['Dist Max']
 
-            # Similaridade espacial/operacional entre livros para formar “pacotes” por pessoa
-            sim_df = (
-                filial_df[['LIVRO', 'LAT', 'LON', 'PERIODO', 'MODAL', 'HORAS_DIARIAS', 'PATRIMONIOS']]
-                .assign(AUX=1)
-                .merge(
-                    filial_df[['LIVRO', 'LAT', 'LON', 'PERIODO', 'MODAL', 'HORAS_DIARIAS', 'PATRIMONIOS']]
-                    .assign(AUX=1),
-                    on='AUX',
-                    how='left',
-                    suffixes=('_I', '_J')
-                )
-                .drop(columns='AUX')
-            )
+            # Se não houver livros livres, só segue para próximo supervisor
+            if len(livros) == 0:
+                continue
 
-            # Distância haversine aproximada (plano) em km entre centros dos livros
+            # Similaridade apenas entre LIVROS livres
+            sim_base = filial_df[filial_df['LIVRO'].isin(livros)][
+                ['LIVRO', 'LAT', 'LON', 'PERIODO', 'MODAL', 'HORAS_DIARIAS', 'PATRIMONIOS']
+            ].copy()
+
+            sim_df = (sim_base.assign(AUX=1)
+                    .merge(sim_base.assign(AUX=1), on='AUX', how='left',
+                            suffixes=('_I','_J'))
+                    .drop(columns='AUX'))
+
             sim_df["DIST"] = np.sqrt(
-                    ((sim_df["LAT_J"] - sim_df["LAT_I"]) * 111.32) ** 2 +
-                    ((sim_df["LON_J"] - sim_df["LON_I"]) * 111.32 *
-                    np.cos(np.radians((sim_df["LAT_I"] + sim_df["LAT_J"]) / 2))) ** 2
-                ).round(2)
+                ((sim_df["LAT_J"] - sim_df["LAT_I"]) * 111.32) ** 2 +
+                ((sim_df["LON_J"] - sim_df["LON_I"]) * 111.32 *
+                np.cos(np.radians((sim_df["LAT_I"] + sim_df["LAT_J"]) / 2))) ** 2
+            ).round(2)
 
-            sim_df = sim_df.drop(columns = ['LAT_I','LAT_J','LON_I', 'LON_J'])
+            sim_df = sim_df.drop(columns=['LAT_I','LAT_J','LON_I','LON_J'])
 
-            # Normaliza “patrimônios em comum” e cria ordenação de emparelhamento
-            sim_df = sim_df.merge(patr_sim, on=['LIVRO_I', 'LIVRO_J'], how='left').fillna(0)
-            sim_df['PATR_COMUM'] = np.maximum(sim_df['PATR_COMUM']/sim_df['PATRIMONIOS_I'], sim_df['PATR_COMUM']/sim_df['PATRIMONIOS_J'])
+            sim_df = sim_df.merge(patr_sim, left_on=['LIVRO_I','LIVRO_J'],
+                                right_on=['LIVRO_I','LIVRO_J'], how='left').fillna(0)
+            sim_df['PATR_COMUM'] = np.maximum(sim_df['PATR_COMUM']/sim_df['PATRIMONIOS_I'],
+                                            sim_df['PATR_COMUM']/sim_df['PATRIMONIOS_J'])
             sim_df['SORT_2'] = (sim_df['HORAS_DIARIAS_I'] != sim_df['HORAS_DIARIAS_J'])
             sim_df['SORT_1'] = (sim_df['MODAL_J'] != sim_df['MODAL_I'])
             sim_df['SORT_4'] = -sim_df['HORAS_DIARIAS_I']
             sim_df['SORT_3'] = (sim_df['MODAL_I'] != 'Moto/Carro')
             sim_df['SORT_5'] = -(sim_df['PATR_COMUM'])
             sim_df['SORT_6'] = (sim_df['DIST'])
-            sim_df = (
-                sim_df[(sim_df['DIST'] <= max_dist) & (sim_df['PERIODO_I'] != sim_df['PERIODO_J'])]
-                .sort_values(by=['SORT_1', 'SORT_2', 'SORT_3', 'SORT_4', 'SORT_5', 'SORT_6'], ascending=True)
-                .drop(columns=['SORT_1', 'SORT_2', 'SORT_3', 'SORT_4', 'SORT_5', 'SORT_6'])
-            )
+            sim_df = (sim_df[(sim_df['DIST'] <= max_dist) & (sim_df['PERIODO_I'] != sim_df['PERIODO_J'])]
+                    .sort_values(by=['SORT_1','SORT_2','SORT_3','SORT_4','SORT_5','SORT_6'], ascending=True)
+                    .drop(columns=['SORT_1','SORT_2','SORT_3','SORT_4','SORT_5','SORT_6']))
 
-            # Heurística de alocação: percorre livros base e “pega” melhor contraparte de outro dia
             x = {i:{j:0 for j in livros} for i in abastecedores}
             y = {i:0 for i in abastecedores}
 
             h_list = []
             for h in sim_df['LIVRO_I'].to_list():
-                if not(h in h_list):
+                if h not in h_list:
                     h_list.append(h)
 
             pivot_livro = {j:i for i,j in pivot.items()}
@@ -1145,13 +1183,15 @@ def main(developer=False, tempo_abastecimento=None, rota_1_pra_1=False,
                     not_alocated.remove(h)
                     p_list = [p for p in periodos if p != periodo[h]]
                     for p in p_list:
-                        sim_list = sim_df[(sim_df['LIVRO_I'] == h) & (sim_df['LIVRO_J'].isin(not_alocated)) & (sim_df['PERIODO_J'] == p)]['LIVRO_J'].to_list()
+                        sim_list = sim_df[(sim_df['LIVRO_I'] == h) &
+                                        (sim_df['LIVRO_J'].isin(not_alocated)) &
+                                        (sim_df['PERIODO_J'] == p)]['LIVRO_J'].to_list()
                         if len(sim_list) > 0:
                             j = sim_list[0]
                             x[i][j] = 1
                             not_alocated.remove(j)
 
-            # Nomeia abastecedores sequencialmente por filial/supervisor
+            # Nomeia abastecedores apenas para os livros livres (mantém os TRAVADOS)
             n = 1
             for i, value_y in y.items():
                 if value_y == 1:
@@ -1160,27 +1200,32 @@ def main(developer=False, tempo_abastecimento=None, rota_1_pra_1=False,
                         if value_x == 1:
                             alocation_dict[j] = abast_name
                     n += 1
-                    
-            # Converte para dict abastecedor -> [rotas]
-            abastecedor_dict = defaultdict(list)
-            for rota, abastecedor in alocation_dict.items():
-                abastecedor_dict[abastecedor].append(rota)
-            abastecedor_rotas = dict(abastecedor_dict)
+
+        # Constrói dict abastecedor -> rotas (inclui travados e livres)
+        abastecedor_dict = defaultdict(list)
+        for rota, abastecedor in alocation_dict.items():
+            abastecedor_dict[abastecedor].append(rota)
+        abastecedor_rotas = dict(abastecedor_dict)
 
     else:
-        # Modo 1:1: abastecedor é derivado do livro agregado (depara_livro)
+        # Modo 1:1: primeiro, mantém travas por fixo
+        livros_travados = set(alocation_dict.keys())
+
+        # Para os demais livros (não travados), usa a regra antiga de nomeação
         depara_livro['ABASTECEDOR'] = 'ABASTECEDOR ' + depara_livro['LIVRO_AGG'].str.extract(r'(\w+) - .*L(\d+)').agg(' '.join, axis=1)
-        alocation_dict = depara_livro.set_index('LIVRO')['ABASTECEDOR'].to_dict()
-        
-        # Constrói dict abastecedor -> lista de livros (para facilitar rotulagem/relatório)
-        abastecedor_dict={}
-        for _,item in depara_livro.iterrows():
-            abastecedor = item["ABASTECEDOR"]
+        depara_nao_travados = depara_livro[~depara_livro['LIVRO'].isin(livros_travados)].copy()
+
+        for _, item in depara_nao_travados.iterrows():
+            alocation_dict[item["LIVRO"]] = item["ABASTECEDOR"]
+
+        # abastecedor -> lista de livros (todos: travados + não travados)
+        abastecedor_dict = defaultdict(list)
+        for _, item in depara_livro.iterrows():
             livro = item["LIVRO"]
-    
-            if abastecedor not in abastecedor_dict:
-                abastecedor_dict[abastecedor] = []
-            abastecedor_dict[abastecedor].append(livro)
+            ab = alocation_dict.get(livro, item["ABASTECEDOR"])
+            abastecedor_dict[ab].append(livro)
+        abastecedor_rotas = dict(abastecedor_dict)
+
 
     # Ajustes finais de escala/modal por abastecedor (se alguma rota do pacote for Full-Time)
     for livros in abastecedor_dict.values():
