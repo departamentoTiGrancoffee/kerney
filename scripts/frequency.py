@@ -76,90 +76,144 @@ def read_txt_as_dict(file_path):
     return config_dict
 
 
-def repasses(visitas_df, patrimonios_df, parceiros_df, depara_point_id):
-    # ----------------------------------------------------------------------------------
-    # Divide patrimônios/parceiros em _A/_B quando a FREQ_BASEADO_EM_CONSUMO excede
-    # significativamente o número de DIAS_POR_SEMANA (aqui usa fator 1.5 como exemplo).
-    # Efeito:
-    #   - Duplica patrimônio e sócios (_A e _B)
-    #   - Ajusta FREQUENCIA_SEMANAL_MINIMA do patrimônio original (metade, arred. p/ cima)
-    #   - Divide janelas de funcionamento do parceiro em dois blocos com sobreposição
-    #   - Atualiza depara_point_id para refletir _A/_B
-    # ----------------------------------------------------------------------------------
-    ## Caso frequência baseada em consumo maior que # dias por semana, aplica repasse dividindo o patrimônio em dois
-    index = (visitas_df['FREQ_BASEADO_EM_CONSUMO'] > visitas_df['DIAS_POR_SEMANA']*1.5) ##### 1.5 deve ser input do usuário
-    patrimonios_repasse = list(visitas_df.loc[index, 'PATRIMONIO'].unique())
-    parceiros_repasse = list(visitas_df.loc[index, 'PARCEIRO'].unique())
-    horario_inicio_default = ''
-    horario_fim_default = ''
+def repasses(visitas_df, patrimonios_df, parceiros_df, depara_point_id,
+             allowed_patrimonios=None, gap_min_hours=3):
+    """
+    Divide patrimônios/parceiros em _A/_B quando a FREQ_BASEADO_EM_CONSUMO excede
+    significativamente o número de DIAS_POR_SEMANA (fator 1.5), e cria janelas de
+    funcionamento com um gap mínimo entre _A e _B.
 
-    ## Visitas
-    # Duplica patrimônios para repasse
-    visitas_df_aux = visitas_df.loc[index].copy()
-    # Adiciona sufixo _A e define o consumo igual aos dias por semana
-    visitas_df.loc[index, 'PARCEIRO'] = visitas_df.loc[index, 'PARCEIRO'] + '_A'
-    visitas_df.loc[index, 'PATRIMONIO'] = visitas_df.loc[index, 'PATRIMONIO'] + '_A'
-    visitas_df.loc[index, 'FREQ_BASEADO_EM_CONSUMO'] = visitas_df.loc[index, 'DIAS_POR_SEMANA']
-    # Adiciona sufixo _B e define consumo igual ao restante
+    Parâmetros
+    ----------
+    visitas_df : pd.DataFrame
+        Base por item/patrimônio com colunas:
+        ['FILIAL','PARCEIRO','PATRIMONIO','DIAS_POR_SEMANA','FREQ_BASEADO_EM_CONSUMO', ...]
+    patrimonios_df : pd.DataFrame
+        Base de patrimônios (aba 'patrimonios').
+    parceiros_df : pd.DataFrame
+        Base de parceiros (aba 'parceiros') com INICIO_FUNCIONAMENTO e FIM_FUNCIONAMENTO (datetime64[ns]).
+    depara_point_id : pd.DataFrame
+        De-para geográfico com ['FILIAL','PARCEIRO','POINT_ID','LAT','LON'].
+    allowed_patrimonios : list[str] | None
+        Lista de patrimônios autorizados a receber repasse (S/N vindo do Excel).
+        Se None, considera todos.
+    gap_min_hours : int | float
+        Gap mínimo entre janelas _A e _B (em horas). Default: 3.
+
+    Retorna
+    -------
+    (visitas_df, patrimonios_df, parceiros_df, depara_point_id) : tuple[pd.DataFrame]
+    """
+    # 1) Seleção dos casos que sofrerão repasse
+    idx_repasse = (visitas_df['FREQ_BASEADO_EM_CONSUMO'] >
+                   visitas_df['DIAS_POR_SEMANA'] * 1.5)  # fator 1.5 mantido
+
+    if allowed_patrimonios is not None:
+        idx_repasse = idx_repasse & visitas_df['PATRIMONIO'].isin(allowed_patrimonios)
+
+    # Se nada atende aos critérios, retorna sem alterações
+    if not np.any(idx_repasse):
+        return visitas_df, patrimonios_df, parceiros_df, depara_point_id
+
+    patrimonios_repasse = visitas_df.loc[idx_repasse, 'PATRIMONIO'].unique().tolist()
+    parceiros_repasse = visitas_df.loc[idx_repasse, 'PARCEIRO'].unique().tolist()
+
+    # 2) VISITAS: duplica linhas e reparte consumo em _A e _B
+    visitas_df_aux = visitas_df.loc[idx_repasse].copy()
+    # _A: trava consumo à capacidade semanal (DIAS_POR_SEMANA)
+    visitas_df.loc[idx_repasse, 'PARCEIRO'] = visitas_df.loc[idx_repasse, 'PARCEIRO'] + '_A'
+    visitas_df.loc[idx_repasse, 'PATRIMONIO'] = visitas_df.loc[idx_repasse, 'PATRIMONIO'] + '_A'
+    visitas_df.loc[idx_repasse, 'FREQ_BASEADO_EM_CONSUMO'] = visitas_df.loc[idx_repasse, 'DIAS_POR_SEMANA']
+    # _B: restante
     visitas_df_aux['PARCEIRO'] = visitas_df_aux['PARCEIRO'] + '_B'
     visitas_df_aux['PATRIMONIO'] = visitas_df_aux['PATRIMONIO'] + '_B'
-    visitas_df_aux['FREQ_BASEADO_EM_CONSUMO'] = visitas_df_aux['FREQ_BASEADO_EM_CONSUMO'] - visitas_df_aux['DIAS_POR_SEMANA']
-    visitas_df = pd.concat([visitas_df, visitas_df_aux]).reset_index(drop=True)
+    visitas_df_aux['FREQ_BASEADO_EM_CONSUMO'] = (
+        visitas_df_aux['FREQ_BASEADO_EM_CONSUMO'] - visitas_df_aux['DIAS_POR_SEMANA']
+    )
+    visitas_df = pd.concat([visitas_df, visitas_df_aux], ignore_index=True)
 
-    # Patrimônios
-    index_patrimonios = (patrimonios_df['PATRIMONIO'].isin(patrimonios_repasse))
-    patrimonios_df.loc[index_patrimonios, 'FREQUENCIA_SEMANAL_MINIMA'] = np.ceil(patrimonios_df.loc[index_patrimonios, 'FREQUENCIA_SEMANAL_MINIMA']/2)
+    # 3) PATRIMÔNIOS: ajusta piso mínimo e duplica linhas
+    idx_pat = patrimonios_df['PATRIMONIO'].isin(patrimonios_repasse)
+    # Piso mínimo pela metade (arredonda para cima)
+    patrimonios_df.loc[idx_pat, 'FREQUENCIA_SEMANAL_MINIMA'] = np.ceil(
+        patrimonios_df.loc[idx_pat, 'FREQUENCIA_SEMANAL_MINIMA'] / 2
+    )
 
-    patrimonios_df_aux = patrimonios_df.loc[index_patrimonios].copy()
+    patrimonios_df_aux = patrimonios_df.loc[idx_pat].copy()
 
-    patrimonios_df.loc[index_patrimonios, 'PATRIMONIO'] = patrimonios_df.loc[index_patrimonios, 'PATRIMONIO'] + '_A'
-    patrimonios_df.loc[index_patrimonios, 'PARCEIRO'] = patrimonios_df.loc[index_patrimonios, 'PARCEIRO'] + '_A'
-
+    # _A
+    patrimonios_df.loc[idx_pat, 'PATRIMONIO'] = patrimonios_df.loc[idx_pat, 'PATRIMONIO'] + '_A'
+    patrimonios_df.loc[idx_pat, 'PARCEIRO'] = patrimonios_df.loc[idx_pat, 'PARCEIRO'] + '_A'
+    # _B
     patrimonios_df_aux['PATRIMONIO'] = patrimonios_df_aux['PATRIMONIO'] + '_B'
     patrimonios_df_aux['PARCEIRO'] = patrimonios_df_aux['PARCEIRO'] + '_B'
 
-    patrimonios_df = pd.concat([patrimonios_df, patrimonios_df_aux]).reset_index(drop=True)
-    parceiros_final = list(patrimonios_df['PARCEIRO'].unique()) 
+    # Mantém flags de repasse nos duplicados, se existirem
+    if 'APLICA_REPASSE' in patrimonios_df.columns:
+        patrimonios_df.loc[idx_pat, 'APLICA_REPASSE'] = 'S'
+        patrimonios_df_aux['APLICA_REPASSE'] = 'S'
+    if 'APLICA_REPASSE_BOOL' in patrimonios_df.columns:
+        patrimonios_df.loc[idx_pat, 'APLICA_REPASSE_BOOL'] = True
+        patrimonios_df_aux['APLICA_REPASSE_BOOL'] = True
 
-    # Parceiros
-    # Ajusta janelas de funcionamento com uma sobreposição (overlap_fraction) para transição
-    index = parceiros_df['PARCEIRO'].isin(parceiros_repasse)
-    parceiros_df.loc[index, 'INICIO_FUNCIONAMENTO'] = np.datetime64('1900-01-01T06:00:00.000000000')
-    parceiros_df.loc[index, 'FIM_FUNCIONAMENTO'] = np.datetime64('1900-01-01T16:45:00.000000000')
+    patrimonios_df = pd.concat([patrimonios_df, patrimonios_df_aux], ignore_index=True)
 
-    parceiros_df['HORAS_FUNCIONAMENTO'] = (parceiros_df['FIM_FUNCIONAMENTO']-parceiros_df['INICIO_FUNCIONAMENTO']).dt.total_seconds()/3600
-    parceiros_df_aux = parceiros_df[index].copy()
-    parceiros_df_aux_og = parceiros_df[index].copy()
+    # Lista final de parceiros após duplicação (para filtrar tabelas derivadas)
+    parceiros_finais = patrimonios_df['PARCEIRO'].unique().tolist()
 
-    overlap_fraction = 0.05
-    horas_total = parceiros_df['HORAS_FUNCIONAMENTO']
-    overlap_timedelta = pd.to_timedelta((horas_total * overlap_fraction).round(1), unit='h')
-    split_point = pd.to_timedelta((horas_total * 0.5).round(0), unit='h') # Divide no meio para o exemplo
+    # 4) PARCEIROS: divide janelas com gap mínimo entre _A e _B
+    # Seleciona somente os parceiros-base (sem sufixo) que sofrerão repasse
+    idx_parc_rep = parceiros_df['PARCEIRO'].isin(parceiros_repasse)
+    parceiros_base = parceiros_df.loc[idx_parc_rep].copy()
 
-    # Ajuste de horário
-    parceiros_df.loc[index, 'PARCEIRO'] = parceiros_df.loc[index, 'PARCEIRO'] + '_A'
-    parceiros_df.loc[index, 'FIM_FUNCIONAMENTO'] = parceiros_df['INICIO_FUNCIONAMENTO'] + split_point + overlap_timedelta
+    # Séries de horários (datetime64[ns])
+    start_s = parceiros_base['INICIO_FUNCIONAMENTO']
+    end_s = parceiros_base['FIM_FUNCIONAMENTO']
 
-    parceiros_df_aux_og.loc[index, 'FIM_FUNCIONAMENTO'] = parceiros_df_aux_og['INICIO_FUNCIONAMENTO'] + split_point + overlap_timedelta
+    dur_s = (end_s - start_s)
+    gap_des = pd.to_timedelta(gap_min_hours, unit='h')
 
-    parceiros_df_aux['PARCEIRO'] = parceiros_df_aux['PARCEIRO'] + '_B'
-    parceiros_df_aux['FIM_FUNCIONAMENTO'] = parceiros_df_aux['FIM_FUNCIONAMENTO']
-    parceiros_df_aux['INICIO_FUNCIONAMENTO'] = parceiros_df_aux['FIM_FUNCIONAMENTO'] - split_point - overlap_timedelta
-    
-    parceiros_df = pd.concat([parceiros_df_aux_og, parceiros_df, parceiros_df_aux])
-    parceiros_df = parceiros_df.loc[parceiros_df['PARCEIRO'].isin(parceiros_final)].reset_index(drop=True)
-    parceiros_df.drop(columns='HORAS_FUNCIONAMENTO', inplace=True)
+    # Ajusta gap quando janela total é curta (mantém viabilidade com janelas não vazias)
+    gap_aplicado = pd.Series(gap_des, index=parceiros_base.index)
+    impossiveis = dur_s <= (gap_des + pd.to_timedelta(1, unit='m'))
+    if impossiveis.any():
+        print("[repasses] Aviso: alguns parceiros não têm duração suficiente para o gap mínimo; reduzindo gap nesses casos.")
+        gap_aplicado.loc[impossiveis] = np.maximum(
+            pd.to_timedelta(0, unit='m'),
+            dur_s.loc[impossiveis] - pd.to_timedelta(1, unit='m')
+        )
 
-    # Depara point id (duplica _A/_B para manter coerência espacial do parceiro)
-    index = depara_point_id['PARCEIRO'].isin(parceiros_repasse)
-    depara_point_id_aux = depara_point_id[index].copy()
-    depara_point_id_aux_2 = depara_point_id[index].copy()
+    # Ponto médio “efetivo” para dividir o intervalo restante (dur - gap) ao meio
+    mid_s = start_s + (dur_s - gap_aplicado) / 2
 
-    depara_point_id_aux['PARCEIRO'] = depara_point_id_aux['PARCEIRO'] + '_A'
-    depara_point_id_aux_2['PARCEIRO'] = depara_point_id_aux_2['PARCEIRO'] + '_B'
+    # Monta _A (manhã) e _B (tarde) com o gap no meio
+    parceiros_A = parceiros_base.copy()
+    parceiros_B = parceiros_base.copy()
 
-    depara_point_id = pd.concat([depara_point_id, depara_point_id_aux, depara_point_id_aux_2])
-    depara_point_id = depara_point_id.loc[depara_point_id['PARCEIRO'].isin(parceiros_final)].reset_index(drop=True)
+    parceiros_A['PARCEIRO'] = parceiros_A['PARCEIRO'] + '_A'
+    parceiros_B['PARCEIRO'] = parceiros_B['PARCEIRO'] + '_B'
+
+    parceiros_A['INICIO_FUNCIONAMENTO'] = start_s
+    parceiros_A['FIM_FUNCIONAMENTO'] = mid_s - gap_aplicado
+
+    parceiros_B['INICIO_FUNCIONAMENTO'] = mid_s + gap_aplicado
+    parceiros_B['FIM_FUNCIONAMENTO'] = end_s
+
+    # Reconstroi parceiros_df: (sem os base) + (A e B), e filtra para os parceiros finais
+    parceiros_sem_base = parceiros_df.loc[~idx_parc_rep].copy()
+    parceiros_df = pd.concat([parceiros_sem_base, parceiros_A, parceiros_B], ignore_index=True)
+    parceiros_df = parceiros_df.loc[parceiros_df['PARCEIRO'].isin(parceiros_finais)].reset_index(drop=True)
+
+    # 5) DEPARA_POINT_ID: duplica mapeamentos para _A/_B e filtra para parceiros finais
+    idx_depara = depara_point_id['PARCEIRO'].isin(parceiros_repasse)
+    depara_A = depara_point_id.loc[idx_depara].copy()
+    depara_B = depara_point_id.loc[idx_depara].copy()
+
+    depara_A['PARCEIRO'] = depara_A['PARCEIRO'] + '_A'
+    depara_B['PARCEIRO'] = depara_B['PARCEIRO'] + '_B'
+
+    depara_point_id = pd.concat([depara_point_id, depara_A, depara_B], ignore_index=True)
+    depara_point_id = depara_point_id.loc[depara_point_id['PARCEIRO'].isin(parceiros_finais)].reset_index(drop=True)
 
     return visitas_df, patrimonios_df, parceiros_df, depara_point_id
 
@@ -228,6 +282,25 @@ def main(developer=False, visitas_duplas=False, nivel_reposicao=None,
     patrimonios_df['PATRIMONIO'] = patrimonios_df['PATRIMONIO'].apply(std_codes)
     patrimonios_df['PARCEIRO'] = patrimonios_df['PARCEIRO'].apply(std_codes)
 
+    # --- NOVO: coluna APLICA_REPASSE (S/N) + validação + bool auxiliar ---
+    if 'APLICA_REPASSE' not in patrimonios_df.columns:
+        patrimonios_df['APLICA_REPASSE'] = 'N'   # default quando a coluna não existe
+    else:
+        patrimonios_df['APLICA_REPASSE'] = (
+            patrimonios_df['APLICA_REPASSE']
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+        invalid = ~patrimonios_df['APLICA_REPASSE'].isin(['S','N'])
+        if invalid.any():
+            linhas_invalidas = patrimonios_df.loc[invalid, ['FILIAL','PARCEIRO','PATRIMONIO','APLICA_REPASSE']]
+            raise ValueError(
+                "Coluna APLICA_REPASSE deve conter apenas 'S' ou 'N'. "
+                f"Exemplos inválidos:\n{linhas_invalidas.head(10).to_string(index=False)}"
+            )
+    patrimonios_df['APLICA_REPASSE_BOOL'] = (patrimonios_df['APLICA_REPASSE'] == 'S')
+
     insumos_df = pd.read_excel(input_folder + 'Dados.xlsx', sheet_name='insumos')
     insumos_df['PATRIMONIO'] = insumos_df['PATRIMONIO'].apply(std_codes)
     insumos_df['PARCEIRO'] = insumos_df['PARCEIRO'].apply(std_codes)
@@ -270,9 +343,10 @@ def main(developer=False, visitas_duplas=False, nivel_reposicao=None,
     
     # 6) Cálculo base por item (cada linha é um SKU/insumo do patrimônio)
     visitas_df = consumo_med_df.copy()
-    
+
     # Valores default para preenchimento de faltas (observa-se 'INSUMO ' com espaço à direita)
-    fill_values = {'INSUMO ': "COPO", 'CONSUMO': 0, 'SEMANAS':1 ,'CAPACIDADE':1, 'MAQUINAS':"-", 'NIVEL_REPOSICAO':0 , 'CONSUMO_SEMANAL': 0} # Aplicando fillna com dicionário
+    fill_values = {'INSUMO': "COPO", 'CONSUMO': 0, 'SEMANAS':1 ,'CAPACIDADE':1, 'MAQUINAS':"-", 'NIVEL_REPOSICAO':0 , 'CONSUMO_SEMANAL': 0} # Aplicando fillna com dicionário
+    visitas_df = visitas_df[visitas_df["CAPACIDADE"].notna()]
     visitas_df = visitas_df.fillna(fill_values)
  
     # 7) Dois modos de calcular FREQ_BASEADO_EM_CONSUMO:
@@ -298,10 +372,19 @@ def main(developer=False, visitas_duplas=False, nivel_reposicao=None,
     else:
         # b) Usando NIVEL_REPOSICAO específico de cada linha
         visitas_df['FREQ_BASEADO_EM_CONSUMO'] = np.ceil(visitas_df['CONSUMO_SEMANAL']/(visitas_df['CAPACIDADE']*(1 - visitas_df['NIVEL_REPOSICAO'])))
+    
 
     # 8) (Opcional) Repasses: divide patrimônio e janelas do parceiro (_A/_B) quando habilitado
     if visitas_duplas:
-        visitas_df, patrimonios_df, parceiros_df, depara_point_id = repasses(visitas_df, patrimonios_df, parceiros_df, depara_point_id)
+        # apenas patrimônios marcados como 'S' entram no repasse
+        patrimonios_autorizados = (
+            patrimonios_df.loc[patrimonios_df['APLICA_REPASSE_BOOL'], 'PATRIMONIO']
+            .unique().tolist()
+        )
+        visitas_df, patrimonios_df, parceiros_df, depara_point_id = repasses(
+            visitas_df, patrimonios_df, parceiros_df, depara_point_id,
+            allowed_patrimonios=patrimonios_autorizados
+        )
 
     # 9) FREQUENCIA_REPOSICAO é limitada por DIAS_POR_SEMANA e pela FREQUENCIA_ATUAL
     #    (evita propor mais visitas que a janela semanal e respeita estado atual)
@@ -310,16 +393,17 @@ def main(developer=False, visitas_duplas=False, nivel_reposicao=None,
                                                                visitas_df['FREQUENCIA_ATUAL'])).astype(int)
 
     # Consolidar por patrimônio pegando o máximo entre insumos (linha -> patrimônio)
-    visitas_df = visitas_df.groupby(['FILIAL', 'PARCEIRO', 'PATRIMONIO', 'FREQUENCIA_ATUAL']).agg({'FREQUENCIA_REPOSICAO':'max'}).reset_index()
+    visitas_df = visitas_df.groupby(['FILIAL', 'PARCEIRO', 'PATRIMONIO']).agg({'FREQUENCIA_REPOSICAO':'max'}).reset_index()
 
     # 10) Aplicar FREQUENCIA_SEMANAL_MINIMA (piso regulatório/operacional por patrimônio)
-    visitas_df = (patrimonios_df[['FILIAL', 'PARCEIRO', 'PATRIMONIO', 'FREQUENCIA_SEMANAL_MINIMA']]
+    visitas_df = (patrimonios_df[['FILIAL', 'PARCEIRO', 'PATRIMONIO', 'FREQUENCIA_SEMANAL_MINIMA', 'FREQUENCIA_ATUAL']]
                 .merge(
                     visitas_df,
                     on=['FILIAL', 'PARCEIRO', 'PATRIMONIO'],
                     how='left')
-                .fillna(0))
-
+                .fillna(0)
+                )
+    
     # 11) Se houver flexibilidade (freq_flex), ajusta o piso mínimo com base na atual
     if freq_flex is not None:
         visitas_df['FREQUENCIA_SEMANAL_MINIMA'] = np.maximum(visitas_df['FREQUENCIA_SEMANAL_MINIMA'], (visitas_df['FREQUENCIA_ATUAL']-freq_flex))
@@ -336,7 +420,7 @@ def main(developer=False, visitas_duplas=False, nivel_reposicao=None,
                       .assign(FREQUENCIA= lambda x: x['FREQUENCIA_PARC'])
                       .drop(columns='FREQUENCIA_PARC'))
         visitas_df["FREQUENCIA"]=visitas_df["FREQUENCIA"].astype(int)
-
+    
     # 14) Renomear colunas para nomenclatura de apresentação (mantém subset de interesse)
     renames = {'FILIAL':'FILIAL', 'PARCEIRO': 'PARCEIRO', 'PATRIMONIO': 'PATRIMONIO', 
                'FREQUENCIA_ATUAL': 'Frequência Atual (visitas/semana)', 'FREQUENCIA_SEMANAL_MINIMA': 'Frequência Mínima (visitas/semana)',
